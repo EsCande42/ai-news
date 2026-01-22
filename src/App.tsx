@@ -41,7 +41,22 @@ const SOURCES: Source[] = [
   },
 ]
 
-const RSS_PROXY = 'https://api.rss2json.com/v1/api.json?rss_url='
+const RSS_PROXIES = [
+  {
+    id: 'rss2json',
+    name: 'rss2json',
+    type: 'json' as const,
+    buildUrl: (rssUrl: string) =>
+      `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(rssUrl)}`,
+  },
+  {
+    id: 'allorigins',
+    name: 'AllOrigins',
+    type: 'xml' as const,
+    buildUrl: (rssUrl: string) =>
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(rssUrl)}`,
+  },
+]
 
 const stripHtml = (html: string) => {
   if (!html) return ''
@@ -72,39 +87,151 @@ const getImage = (item: Record<string, unknown>) => {
   return null
 }
 
-async function fetchSource(source: Source) {
-  const response = await fetch(`${RSS_PROXY}${encodeURIComponent(source.rssUrl)}`)
-  if (!response.ok) {
-    throw new Error(`Не удалось загрузить ${source.name}`)
+const getFirstText = (node: ParentNode, selectors: string[]) => {
+  for (const selector of selectors) {
+    const value = node.querySelector(selector)?.textContent?.trim()
+    if (value) return value
   }
-  const data = (await response.json()) as {
-    status?: string
-    message?: string
-    items?: Array<Record<string, unknown>>
+  return ''
+}
+
+const getFirstAttr = (node: ParentNode, selectors: string[], attr: string) => {
+  for (const selector of selectors) {
+    const value = node.querySelector(selector)?.getAttribute(attr)?.trim()
+    if (value) return value
   }
-  if (data.status && data.status !== 'ok') {
-    throw new Error(data.message ?? `Не удалось загрузить ${source.name}`)
-  }
-  const items = data.items ?? []
-  return items.map((item) => {
-    const title = (item.title as string) ?? 'Без названия'
-    const rawSummary =
-      (item.description as string) ??
-      (item.content as string) ??
-      (item.contentSnippet as string) ??
-      ''
+  return ''
+}
+
+const extractImageFromHtml = (html: string) => {
+  if (!html) return null
+  const doc = new DOMParser().parseFromString(html, 'text/html')
+  const img = doc.querySelector('img')
+  return img?.getAttribute('src') ?? null
+}
+
+const parseRssItems = (doc: Document, source: Source) => {
+  const nodes = Array.from(doc.querySelectorAll('item'))
+  return nodes.map((item) => {
+    const title = getFirstText(item, ['title']) || 'Без названия'
+    const rawSummary = getFirstText(item, [
+      'content\\:encoded',
+      'description',
+      'content',
+      'summary',
+    ])
+    const link = getFirstText(item, ['link'])
+    const publishedAt = getFirstText(item, ['pubDate', 'published', 'updated', 'dc\\:date'])
+    const imageUrl =
+      getFirstAttr(item, ['media\\:content', 'media\\:thumbnail', 'enclosure'], 'url') ||
+      extractImageFromHtml(rawSummary)
 
     return {
-      id: `${source.id}-${item.guid ?? item.link ?? title}`,
+      id: `${source.id}-${getFirstText(item, ['guid']) || link || title}`,
       sourceId: source.id,
       source: source.name,
       title,
       summary: truncate(stripHtml(rawSummary).trim()),
-      imageUrl: getImage(item),
-      link: (item.link as string) ?? '#',
-      publishedAt: (item.pubDate as string) ?? '',
+      imageUrl,
+      link,
+      publishedAt,
     } as NewsItem
   })
+}
+
+const parseAtomEntries = (doc: Document, source: Source) => {
+  const nodes = Array.from(doc.querySelectorAll('entry'))
+  return nodes.map((entry) => {
+    const title = getFirstText(entry, ['title']) || 'Без названия'
+    const linkNode =
+      entry.querySelector('link[rel="alternate"]') ?? entry.querySelector('link')
+    const link = linkNode?.getAttribute('href')?.trim() || linkNode?.textContent?.trim() || ''
+    const rawSummary = getFirstText(entry, ['content', 'summary'])
+    const publishedAt = getFirstText(entry, ['published', 'updated'])
+    const imageUrl =
+      getFirstAttr(entry, ['media\\:content', 'media\\:thumbnail'], 'url') ||
+      extractImageFromHtml(rawSummary)
+
+    return {
+      id: `${source.id}-${getFirstText(entry, ['id']) || link || title}`,
+      sourceId: source.id,
+      source: source.name,
+      title,
+      summary: truncate(stripHtml(rawSummary).trim()),
+      imageUrl,
+      link,
+      publishedAt,
+    } as NewsItem
+  })
+}
+
+const parseXmlFeed = (xmlText: string, source: Source) => {
+  const doc = new DOMParser().parseFromString(xmlText, 'text/xml')
+  if (doc.querySelector('parsererror')) {
+    throw new Error(`Не удалось разобрать RSS ${source.name}`)
+  }
+  const rssItems = doc.querySelectorAll('item')
+  if (rssItems.length > 0) return parseRssItems(doc, source)
+
+  const atomEntries = doc.querySelectorAll('entry')
+  if (atomEntries.length > 0) return parseAtomEntries(doc, source)
+
+  return []
+}
+
+async function fetchSource(source: Source) {
+  let lastError: Error | null = null
+
+  for (const proxy of RSS_PROXIES) {
+    try {
+      const response = await fetch(proxy.buildUrl(source.rssUrl))
+      if (!response.ok) {
+        throw new Error(`Не удалось загрузить ${source.name}`)
+      }
+
+      if (proxy.type === 'json') {
+        const data = (await response.json()) as {
+          status?: string
+          message?: string
+          items?: Array<Record<string, unknown>>
+        }
+        if (data.status && data.status !== 'ok') {
+          throw new Error(data.message ?? `Не удалось загрузить ${source.name}`)
+        }
+        const items = data.items ?? []
+        return items.map((item) => {
+          const title = (item.title as string) ?? 'Без названия'
+          const rawSummary =
+            (item.description as string) ??
+            (item.content as string) ??
+            (item.contentSnippet as string) ??
+            ''
+
+          return {
+            id: `${source.id}-${item.guid ?? item.link ?? title}`,
+            sourceId: source.id,
+            source: source.name,
+            title,
+            summary: truncate(stripHtml(rawSummary).trim()),
+            imageUrl: getImage(item),
+            link: (item.link as string) ?? '#',
+            publishedAt: (item.pubDate as string) ?? '',
+          } as NewsItem
+        })
+      }
+
+      const xmlText = await response.text()
+      const items = parseXmlFeed(xmlText, source)
+      if (items.length > 0) {
+        return items
+      }
+      throw new Error(`Пустой ответ ${source.name}`)
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error('Источник недоступен')
+    }
+  }
+
+  throw lastError ?? new Error(`Не удалось загрузить ${source.name}`)
 }
 
 function App() {
